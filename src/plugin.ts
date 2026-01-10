@@ -3,7 +3,7 @@
  *
  * Fetches metadata from The Movie Database (TMDB) API.
  * Supports both v3 API keys and v4 Bearer tokens.
- * Downloads poster and backdrop images to /files/plugin/tmdb/
+ * Downloads poster and backdrop images to /output/
  *
  * ============================================================================
  * PLUGIN MOUNT ARCHITECTURE - DO NOT MODIFY WITHOUT AUTHORIZATION
@@ -13,11 +13,11 @@
  *
  *   1. /files              (READ-ONLY)  - Shared media files, read access only
  *   2. /cache              (READ-WRITE) - Plugin-specific cache folder
- *   3. /files/plugin/tmdb  (READ-WRITE) - Plugin output folder for posters/images
+ *   3. /output  (READ-WRITE) - Plugin output folder for posters/images
  *
  * SECURITY: Plugins must NEVER write to /files directly.
  * - Use /cache for temporary/cache data (e.g., TMDB API responses)
- * - Use /files/plugin/tmdb for output files (e.g., posters, backdrops)
+ * - Use /output for output files (e.g., posters, backdrops)
  *
  * ============================================================================
  *
@@ -44,13 +44,13 @@ const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
  * MOUNT PATHS - Enforced by plugin architecture
  * ============================================================================
  * FILES_PATH (/files) - READ-ONLY access to media files
- * PLUGIN_OUTPUT_PATH (/files/plugin/tmdb) - READ-WRITE for plugin-generated files
+ * PLUGIN_OUTPUT_PATH (/output) - READ-WRITE for plugin-generated files
  * CACHE_PATH (/cache) - READ-WRITE for plugin cache (handled by cache.ts)
  * ============================================================================
  */
 // Use globalThis.process to avoid conflict with the exported process function
 const FILES_PATH = (globalThis as any).process?.env?.FILES_PATH || '/files';
-const PLUGIN_OUTPUT_PATH = (globalThis as any).process?.env?.PLUGIN_OUTPUT_PATH || '/files/plugin/tmdb';
+const PLUGIN_OUTPUT_PATH = '/output';
 
 export const manifest: PluginManifest = {
     id: 'tmdb',
@@ -186,7 +186,7 @@ function sanitizeFilename(name: string): string {
 /**
  * Download an image from URL to local path
  *
- * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/files/plugin/tmdb)
+ * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/output)
  * NOT to /files directly. See mount architecture comments at top of file.
  */
 async function downloadImage(imageUrl: string, localPath: string): Promise<boolean> {
@@ -219,7 +219,7 @@ async function downloadImage(imageUrl: string, localPath: string): Promise<boole
 /**
  * Download and hash an image, returning its CID and path
  *
- * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/files/plugin/tmdb)
+ * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/output)
  * This is the plugin's dedicated output folder with READ-WRITE access.
  * Other plugins can read these files but cannot write to this location.
  *
