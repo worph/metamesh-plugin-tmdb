@@ -30,7 +30,8 @@
  */
 
 import axios from 'axios';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { createHash } from 'crypto';
 import * as path from 'path';
 import { pipeline } from 'stream/promises';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
@@ -51,6 +52,79 @@ const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
 // Use globalThis.process to avoid conflict with the exported process function
 const FILES_PATH = (globalThis as any).process?.env?.FILES_PATH || '/files';
 const PLUGIN_OUTPUT_PATH = '/output';
+
+/**
+ * Compute midhash256 CID for a file (matches meta-hash algorithm)
+ *
+ * Algorithm:
+ * - For files <= 1MB: Hashes entire file content + 8-byte size prefix
+ * - For files > 1MB: Hashes middle 1MB + 8-byte size prefix
+ * - Returns CIDv1 with custom codec 0x1000
+ */
+function computeMidHash256(filePath: string): string {
+    const SAMPLE_SIZE = 1024 * 1024; // 1MB
+    // varint encoding of 0x1000 (4096) for both codec and hash function code
+    const MIDHASH_VARINT = Buffer.from([0x80, 0x20]);
+
+    // Get file size
+    const stats = statSync(filePath);
+    const fileSize = stats.size;
+
+    // Create size buffer (64-bit big-endian)
+    const sizeBuffer = Buffer.allocUnsafe(8);
+    sizeBuffer.writeBigUInt64BE(BigInt(fileSize), 0);
+
+    // Extract sample data
+    let sampleData: Buffer;
+    if (fileSize <= SAMPLE_SIZE) {
+        // Small file: read entire content
+        const fd = openSync(filePath, 'r');
+        sampleData = Buffer.allocUnsafe(fileSize);
+        readSync(fd, sampleData, 0, fileSize, 0);
+        closeSync(fd);
+    } else {
+        // Large file: read middle 1MB
+        const middleOffset = Math.floor((fileSize - SAMPLE_SIZE) / 2);
+        const fd = openSync(filePath, 'r');
+        sampleData = Buffer.allocUnsafe(SAMPLE_SIZE);
+        readSync(fd, sampleData, 0, SAMPLE_SIZE, middleOffset);
+        closeSync(fd);
+    }
+
+    // Compute SHA-256 hash of [size + sample]
+    const hashInput = Buffer.concat([sizeBuffer, sampleData]);
+    const hashBuffer = createHash('sha256').update(hashInput).digest();
+
+    // Build CIDv1: version (0x01) + codec (varint) + multihash
+    // Codec 0x1000 = varint [0x80, 0x20]
+    // Multihash: function-code (varint 0x1000) + length (0x20) + hash
+    const cidBytes = Buffer.concat([
+        Buffer.from([0x01]),           // CIDv1
+        MIDHASH_VARINT,                // codec 0x1000 as varint
+        MIDHASH_VARINT,                // hash function code 0x1000 as varint
+        Buffer.from([0x20]),           // 32 bytes digest length
+        hashBuffer
+    ]);
+
+    // Encode as base32lower with 'b' prefix (multibase)
+    const base32Chars = 'abcdefghijklmnopqrstuvwxyz234567';
+    let cid = 'b';
+    let bits = 0;
+    let value = 0;
+    for (const byte of cidBytes) {
+        value = (value << 8) | byte;
+        bits += 8;
+        while (bits >= 5) {
+            bits -= 5;
+            cid += base32Chars[(value >> bits) & 0x1f];
+        }
+    }
+    if (bits > 0) {
+        cid += base32Chars[(value << (5 - bits)) & 0x1f];
+    }
+
+    return cid;
+}
 
 export const manifest: PluginManifest = {
     id: 'tmdb',
@@ -217,22 +291,21 @@ async function downloadImage(imageUrl: string, localPath: string): Promise<boole
 }
 
 /**
- * Download and hash an image, returning its CID and path
+ * Download and hash an image, returning its CID
  *
  * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/output)
  * This is the plugin's dedicated output folder with READ-WRITE access.
- * Other plugins can read these files but cannot write to this location.
+ * The files will be picked up by meta-sort's file watcher and processed like any other file.
  *
- * @returns {Promise<{cid: string, path: string} | null>}
+ * @returns {Promise<string | null>} The midhash256 CID of the downloaded image
  */
 async function downloadAndHashImage(
     imagePath: string,
     imageType: string,
     title: string,
     year: string | undefined,
-    tmdbId: string,
-    metaCore: MetaCoreClient
-): Promise<{ cid: string; path: string } | null> {
+    tmdbId: string
+): Promise<string | null> {
     if (!imagePath) {
         return null;
     }
@@ -249,10 +322,6 @@ async function downloadAndHashImage(
     // IMPORTANT: Write to PLUGIN_OUTPUT_PATH, not FILES_PATH
     // This respects the mount architecture: /files is READ-ONLY
     const localPath = path.join(PLUGIN_OUTPUT_PATH, filename);
-
-    // Relative path for storage (relative to /files for meta-core compatibility)
-    // Path format: plugin/tmdb/<filename>
-    const relativePath = `plugin/tmdb/${filename}`;
 
     // Check if file already exists (skip download)
     if (existsSync(localPath)) {
@@ -271,15 +340,11 @@ async function downloadAndHashImage(
         }
     }
 
-    // Compute CID using meta-core API
+    // Compute midhash256 CID (same algorithm as meta-sort file entries)
     try {
-        const cid = await metaCore.computeFileCID(relativePath);
-        if (cid) {
-            console.log(`[tmdb] Image ${imageType} CID: ${cid}`);
-            return { cid, path: relativePath };
-        } else {
-            console.warn(`[tmdb] Failed to compute CID for ${localPath}`);
-        }
+        const cid = computeMidHash256(localPath);
+        console.log(`[tmdb] Image ${imageType} CID: ${cid}`);
+        return cid;
     } catch (e) {
         console.error(`[tmdb] Failed to compute CID for ${localPath}: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -479,35 +544,32 @@ async function applyTmdbData(
     await metaCore.addToSet(cid, 'tags', 'tmdb-verified');
 
     // Download poster and backdrop images to plugin output folder
+    // The files will be picked up by meta-sort's file watcher and processed like any other file
     if (data.poster_path && tmdbId) {
-        const posterResult = await downloadAndHashImage(
+        const posterCid = await downloadAndHashImage(
             data.poster_path,
             'poster',
             displayTitle,
             year,
-            tmdbId,
-            metaCore as any
+            tmdbId
         );
-        if (posterResult) {
-            await metaCore.setProperty(cid, 'poster', posterResult.cid);
-            await metaCore.setProperty(cid, 'posterPath', posterResult.path);
-            console.log(`[tmdb] Set poster CID: ${posterResult.cid}`);
+        if (posterCid) {
+            await metaCore.setProperty(cid, 'poster', posterCid);
+            console.log(`[tmdb] Set poster CID: ${posterCid}`);
         }
     }
 
     if (data.backdrop_path && tmdbId) {
-        const backdropResult = await downloadAndHashImage(
+        const backdropCid = await downloadAndHashImage(
             data.backdrop_path,
             'backdrop',
             displayTitle,
             year,
-            tmdbId,
-            metaCore as any
+            tmdbId
         );
-        if (backdropResult) {
-            await metaCore.setProperty(cid, 'backdrop', backdropResult.cid);
-            await metaCore.setProperty(cid, 'backdropPath', backdropResult.path);
-            console.log(`[tmdb] Set backdrop CID: ${backdropResult.cid}`);
+        if (backdropCid) {
+            await metaCore.setProperty(cid, 'backdrop', backdropCid);
+            console.log(`[tmdb] Set backdrop CID: ${backdropCid}`);
         }
     }
 }
