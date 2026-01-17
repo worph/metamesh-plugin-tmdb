@@ -37,6 +37,15 @@ import { pipeline } from 'stream/promises';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
 import { readJson, writeJson } from './cache.js';
+import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
+
+// Initialize WebDAV client if WEBDAV_URL is set
+const webdavClient = createWebDAVClient();
+if (webdavClient) {
+    console.log('[tmdb] Using WebDAV for file access');
+} else {
+    console.log('[tmdb] Using direct filesystem access');
+}
 
 const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
 
@@ -61,7 +70,7 @@ const PLUGIN_OUTPUT_PATH = '/output';
  * - For files > 1MB: Hashes middle 1MB + 8-byte size prefix
  * - Returns CIDv1 with custom codec 0x1000
  */
-function computeMidHash256(filePath: string): string {
+function computeMidHash256Sync(filePath: string): string {
     const SAMPLE_SIZE = 1024 * 1024; // 1MB
     // varint encoding of 0x1000 (4096) for both codec and hash function code
     const MIDHASH_VARINT = Buffer.from([0x80, 0x20]);
@@ -90,6 +99,44 @@ function computeMidHash256(filePath: string): string {
         readSync(fd, sampleData, 0, SAMPLE_SIZE, middleOffset);
         closeSync(fd);
     }
+
+    return computeMidHash256FromData(fileSize, sampleData);
+}
+
+/**
+ * Compute midhash256 CID via WebDAV
+ */
+async function computeMidHash256WebDAV(client: WebDAVClient, filePath: string): Promise<string> {
+    const SAMPLE_SIZE = 1024 * 1024; // 1MB
+
+    // Get file size via HTTP HEAD
+    const stats = await client.stat(filePath);
+    const fileSize = stats.size;
+
+    // Read sample data via HTTP Range request
+    let sampleData: Buffer;
+    if (fileSize <= SAMPLE_SIZE) {
+        // Small file: read entire content
+        sampleData = await client.readBytes(filePath, 0, fileSize - 1);
+    } else {
+        // Large file: read middle 1MB
+        const middleOffset = Math.floor((fileSize - SAMPLE_SIZE) / 2);
+        sampleData = await client.readBytes(filePath, middleOffset, middleOffset + SAMPLE_SIZE - 1);
+    }
+
+    return computeMidHash256FromData(fileSize, sampleData);
+}
+
+/**
+ * Compute midhash256 CID from file size and sample data
+ */
+function computeMidHash256FromData(fileSize: number, sampleData: Buffer): string {
+    // varint encoding of 0x1000 (4096) for both codec and hash function code
+    const MIDHASH_VARINT = Buffer.from([0x80, 0x20]);
+
+    // Create size buffer (64-bit big-endian)
+    const sizeBuffer = Buffer.allocUnsafe(8);
+    sizeBuffer.writeBigUInt64BE(BigInt(fileSize), 0);
 
     // Compute SHA-256 hash of [size + sample]
     const hashInput = Buffer.concat([sizeBuffer, sampleData]);
@@ -124,6 +171,16 @@ function computeMidHash256(filePath: string): string {
     }
 
     return cid;
+}
+
+/**
+ * Compute midhash256 CID for a file (auto-selects WebDAV or filesystem)
+ */
+async function computeMidHash256(filePath: string): Promise<string> {
+    if (webdavClient) {
+        return computeMidHash256WebDAV(webdavClient, filePath);
+    }
+    return computeMidHash256Sync(filePath);
 }
 
 export const manifest: PluginManifest = {
@@ -341,8 +398,9 @@ async function downloadAndHashImage(
     }
 
     // Compute midhash256 CID (same algorithm as meta-sort file entries)
+    // Note: For /output files, we use sync version since they're on local filesystem
     try {
-        const cid = computeMidHash256(localPath);
+        const cid = computeMidHash256Sync(localPath);
         console.log(`[tmdb] Image ${imageType} CID: ${cid}`);
         return cid;
     } catch (e) {
