@@ -3,21 +3,21 @@
  *
  * Fetches metadata from The Movie Database (TMDB) API.
  * Supports both v3 API keys and v4 Bearer tokens.
- * Downloads poster and backdrop images to /output/
+ * Downloads poster and backdrop images via WebDAV to /files/plugin/tmdb/
  *
  * ============================================================================
- * PLUGIN MOUNT ARCHITECTURE - DO NOT MODIFY WITHOUT AUTHORIZATION
+ * PLUGIN FILE ACCESS ARCHITECTURE
  * ============================================================================
  *
- * Each plugin container has exactly 3 mounts:
+ * File access via WebDAV (WEBDAV_URL environment variable):
+ *   - Read media files:  GET  /webdav/watch/...  or /webdav/test/...
+ *   - Write output:      PUT  /webdav/plugin/tmdb/...
+ *   - Cache:             Local /cache mount (for JSON cache files)
  *
- *   1. /files              (READ-ONLY)  - Shared media files, read access only
- *   2. /cache              (READ-WRITE) - Plugin-specific cache folder
- *   3. /output  (READ-WRITE) - Plugin output folder for posters/images
- *
- * SECURITY: Plugins must NEVER write to /files directly.
- * - Use /cache for temporary/cache data (e.g., TMDB API responses)
- * - Use /output for output files (e.g., posters, backdrops)
+ * Benefits:
+ *   - No output mount needed on plugin containers
+ *   - Consistent read/write architecture via HTTP
+ *   - Works in any orchestration environment
  *
  * ============================================================================
  *
@@ -30,37 +30,34 @@
  */
 
 import axios from 'axios';
-import { createWriteStream, existsSync, mkdirSync, statSync, openSync, readSync, closeSync } from 'fs';
+import { statSync, openSync, readSync, closeSync } from 'fs';
 import { createHash } from 'crypto';
 import * as path from 'path';
-import { pipeline } from 'stream/promises';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
 import { readJson, writeJson } from './cache.js';
 import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
 
-// Initialize WebDAV client if WEBDAV_URL is set
+// Initialize WebDAV client - required for plugin operation
 const webdavClient = createWebDAVClient();
 if (webdavClient) {
-    console.log('[tmdb] Using WebDAV for file access');
+    console.log('[tmdb] WebDAV client initialized for file access');
 } else {
-    console.log('[tmdb] Using direct filesystem access');
+    console.warn('[tmdb] WARNING: WEBDAV_URL not set - plugin will not be able to write output files');
 }
 
 const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
 
 /**
  * ============================================================================
- * MOUNT PATHS - Enforced by plugin architecture
+ * PLUGIN OUTPUT PATH - Written via WebDAV
  * ============================================================================
- * FILES_PATH (/files) - READ-ONLY access to media files
- * PLUGIN_OUTPUT_PATH (/output) - READ-WRITE for plugin-generated files
- * CACHE_PATH (/cache) - READ-WRITE for plugin cache (handled by cache.ts)
+ * Output files (posters, backdrops) are written via WebDAV PUT requests.
+ * Path: /files/plugin/tmdb/<filename> (accessible at WEBDAV_URL/plugin/tmdb/)
+ * CACHE_PATH (/cache) - Local mount for plugin cache (handled by cache.ts)
  * ============================================================================
  */
-// Use globalThis.process to avoid conflict with the exported process function
-const FILES_PATH = (globalThis as any).process?.env?.FILES_PATH || '/files';
-const PLUGIN_OUTPUT_PATH = '/output';
+const PLUGIN_OUTPUT_WEBDAV_PATH = '/files/plugin/tmdb';
 
 /**
  * Compute midhash256 CID for a file (matches meta-hash algorithm)
@@ -315,34 +312,32 @@ function sanitizeFilename(name: string): string {
 }
 
 /**
- * Download an image from URL to local path
+ * Download an image from URL and upload to WebDAV
  *
- * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/output)
- * NOT to /files directly. See mount architecture comments at top of file.
+ * Images are written via WebDAV PUT to /files/plugin/tmdb/
+ * This allows output without mounting a volume to the plugin container.
  */
-async function downloadImage(imageUrl: string, localPath: string): Promise<boolean> {
+async function downloadImageToWebDAV(
+    client: WebDAVClient,
+    imageUrl: string,
+    webdavPath: string
+): Promise<boolean> {
     try {
+        // Download image as buffer
         const response = await axios({
             method: 'get',
             url: imageUrl,
-            responseType: 'stream',
+            responseType: 'arraybuffer',
             timeout: 30000,
         });
 
-        // Ensure directory exists
-        const dir = path.dirname(localPath);
-        if (!existsSync(dir)) {
-            mkdirSync(dir, { recursive: true });
-        }
+        // Upload to WebDAV
+        await client.writeFile(webdavPath, Buffer.from(response.data));
 
-        // Pipe the response to a file
-        const writer = createWriteStream(localPath);
-        await pipeline(response.data, writer);
-
-        console.log(`[tmdb] Downloaded image to ${localPath}`);
+        console.log(`[tmdb] Uploaded image to WebDAV: ${webdavPath}`);
         return true;
     } catch (error) {
-        console.error(`[tmdb] Failed to download image from ${imageUrl}: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`[tmdb] Failed to download/upload image from ${imageUrl}: ${error instanceof Error ? error.message : String(error)}`);
         return false;
     }
 }
@@ -350,8 +345,7 @@ async function downloadImage(imageUrl: string, localPath: string): Promise<boole
 /**
  * Download and hash an image, returning its CID
  *
- * IMPORTANT: Images are saved to PLUGIN_OUTPUT_PATH (/output)
- * This is the plugin's dedicated output folder with READ-WRITE access.
+ * Images are written via WebDAV PUT to /files/plugin/tmdb/
  * The files will be picked up by meta-sort's file watcher and processed like any other file.
  *
  * @returns {Promise<string | null>} The midhash256 CID of the downloaded image
@@ -367,6 +361,11 @@ async function downloadAndHashImage(
         return null;
     }
 
+    if (!webdavClient) {
+        console.error(`[tmdb] WebDAV client not available, cannot write output files`);
+        return null;
+    }
+
     const imageUrl = `${IMAGE_BASE_URL}${imagePath}`;
     const ext = path.extname(imagePath) || '.jpg';
 
@@ -376,35 +375,28 @@ async function downloadAndHashImage(
     const yearStr = year ? ` (${year})` : '';
     const filename = `${safeName}${yearStr}[tmdb${tmdbId}]_${imageType}${ext}`;
 
-    // IMPORTANT: Write to PLUGIN_OUTPUT_PATH, not FILES_PATH
-    // This respects the mount architecture: /files is READ-ONLY
-    const localPath = path.join(PLUGIN_OUTPUT_PATH, filename);
+    // WebDAV path for output file
+    const webdavPath = `${PLUGIN_OUTPUT_WEBDAV_PATH}/${filename}`;
 
-    // Check if file already exists (skip download)
-    if (existsSync(localPath)) {
-        console.log(`[tmdb] Image already exists: ${localPath}`);
+    // Check if file already exists via WebDAV HEAD
+    const exists = await webdavClient.exists(webdavPath);
+    if (exists) {
+        console.log(`[tmdb] Image already exists: ${webdavPath}`);
     } else {
-        // Ensure plugin output directory exists
-        if (!existsSync(PLUGIN_OUTPUT_PATH)) {
-            mkdirSync(PLUGIN_OUTPUT_PATH, { recursive: true });
-            console.log(`[tmdb] Created plugin output directory: ${PLUGIN_OUTPUT_PATH}`);
-        }
-
-        // Download the image
-        const downloaded = await downloadImage(imageUrl, localPath);
-        if (!downloaded) {
+        // Download the image and upload via WebDAV
+        const uploaded = await downloadImageToWebDAV(webdavClient, imageUrl, webdavPath);
+        if (!uploaded) {
             return null;
         }
     }
 
-    // Compute midhash256 CID (same algorithm as meta-sort file entries)
-    // Note: For /output files, we use sync version since they're on local filesystem
+    // Compute midhash256 CID via WebDAV (reads file back to compute hash)
     try {
-        const cid = computeMidHash256Sync(localPath);
+        const cid = await computeMidHash256WebDAV(webdavClient, webdavPath);
         console.log(`[tmdb] Image ${imageType} CID: ${cid}`);
         return cid;
     } catch (e) {
-        console.error(`[tmdb] Failed to compute CID for ${localPath}: ${e instanceof Error ? e.message : String(e)}`);
+        console.error(`[tmdb] Failed to compute CID for ${webdavPath}: ${e instanceof Error ? e.message : String(e)}`);
     }
 
     return null;
