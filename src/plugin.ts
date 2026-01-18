@@ -186,7 +186,7 @@ export const manifest: PluginManifest = {
     version: '1.0.0',
     description: 'Fetches metadata from The Movie Database (TMDB) API',
     author: 'MetaMesh',
-    dependencies: ['file-info', 'filename-parser', 'jellyfin-nfo'],
+    dependencies: ['file-info', 'filename-parser'],
     priority: 30,
     color: '#01B4E4',
     defaultQueue: 'background',

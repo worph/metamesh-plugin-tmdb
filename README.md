@@ -34,7 +34,8 @@ This plugin enriches video metadata by querying the TMDB API:
 
 ## Dependencies
 
-- Requires `file-info`, `filename-parser`, and `jellyfin-nfo` plugins
+- Requires `file-info` and `filename-parser` plugins
+- Optional: `jellyfin-nfo` (provides IMDB IDs from NFO files for better matching)
 
 ## Configuration
 
@@ -62,9 +63,20 @@ npm start
 
 ## Docker
 
+Build the image for the dev stack:
+
 ```bash
-docker build -t metamesh-plugin-tmdb .
-docker run -p 8080:8080 metamesh-plugin-tmdb
+# From the plugin directory
+docker build -t metamesh-plugin-tmdb:main .
+
+# Restart the plugin container (if already running)
+docker restart meta-plugin-tmdb-0
+```
+
+Run standalone:
+
+```bash
+docker run -p 8080:8080 metamesh-plugin-tmdb:main
 ```
 
 ## Environment Variables
