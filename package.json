@@ -1,6 +1,7 @@
 {
   "name": "@metazla/plugin-tmdb",
   "version": "1.0.0",
+  "packageManager": "pnpm@10.28.0",
   "description": "MetaMesh plugin: Fetches metadata from TMDB API",
   "type": "module",
   "main": "dist/index.js",
