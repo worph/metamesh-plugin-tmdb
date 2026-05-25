@@ -343,12 +343,13 @@ async function downloadImageToWebDAV(
 }
 
 /**
- * Download and hash an image, returning its CID
+ * Download and hash an image, returning its CID.
  *
- * Images are written via WebDAV PUT to /files/plugin/tmdb/
- * The files will be picked up by meta-sort's file watcher and processed like any other file.
- *
- * @returns {Promise<string | null>} The midhash256 CID of the downloaded image
+ * Images are written via WebDAV PUT to /files/plugin/tmdb/. The watcher
+ * indexes that directory as a first-class file root, so each downloaded
+ * image becomes a normal metadata entry with a midhash256 alias. The
+ * editor's CID preview then resolves through standard CID resolution —
+ * no need to store any path in the parent file's metadata.
  */
 async function downloadAndHashImage(
     imagePath: string,
@@ -593,8 +594,10 @@ async function applyTmdbData(
     // Add tmdb-verified tag (same as old processor)
     await metaCore.addToSet(cid, 'tags', 'tmdb-verified');
 
-    // Download poster and backdrop images to plugin output folder
-    // The files will be picked up by meta-sort's file watcher and processed like any other file
+    // Download poster and backdrop images to plugin output folder. The
+    // watcher picks them up as first-class file entries, so all we need to
+    // store is the CID — `/api/file/{cid}` resolves through the standard
+    // reverse index, no path companion needed.
     if (data.poster_path && tmdbId) {
         const posterCid = await downloadAndHashImage(
             data.poster_path,
