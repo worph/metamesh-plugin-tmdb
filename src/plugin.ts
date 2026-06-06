@@ -433,8 +433,11 @@ export async function process(
             return;
         }
 
-        // Skip if already has TMDB data (unless forceRecompute)
-        if (existingMeta?.tmdbid && !forceRecompute) {
+        // Skip only if FULLY enriched already (tmdbid AND poster), unless forced.
+        // A record carrying a tmdbid but no poster — e.g. a gateway anchor or
+        // jellyfin-nfo that set only the id — still runs, so the full cycle
+        // (poster download + plot/genres) completes via getByTmdbId below.
+        if (existingMeta?.tmdbid && existingMeta?.poster && !forceRecompute) {
             await sendCallback({
                 taskId: request.taskId,
                 status: 'skipped',
@@ -445,7 +448,7 @@ export async function process(
         }
 
         if (forceRecompute) {
-            console.log(`[tmdb] Force recompute enabled for ${request.filePath}`);
+            console.log(`[tmdb] Force recompute enabled for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
         }
 
         // Get midhash for caching
@@ -455,7 +458,7 @@ export async function process(
         if (midhash && !forceRecompute) {
             const cachedData = await readJson<any>(`${midhash}_tmdb.json`);
             if (cachedData) {
-                console.log(`[tmdb] Using cached TMDB data for ${request.filePath}`);
+                console.log(`[tmdb] Using cached TMDB data for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
                 await applyTmdbData(metaCore, cid, cachedData);
                 await sendCallback({
                     taskId: request.taskId,
@@ -468,9 +471,21 @@ export async function process(
 
         let tmdbData = null;
 
-        // Try by IMDB ID first
+        // Resolve by a known TMDB id first (authoritative — e.g. a gateway
+        // anchor or jellyfin-nfo). Completes the full cycle (poster + plot +
+        // genres) from an id alone, with no fuzzy re-search.
+        const knownTmdbId = existingMeta?.tmdbid;
+        if (knownTmdbId) {
+            const mediaType =
+                existingMeta?.videoType === 'tvshow' || existingMeta?.videoType === 'tv'
+                    ? 'tv'
+                    : 'movie';
+            tmdbData = await getByTmdbId(knownTmdbId, mediaType);
+        }
+
+        // Try by IMDB ID
         const imdbId = existingMeta?.imdbid;
-        if (imdbId) {
+        if (!tmdbData && imdbId) {
             tmdbData = await findByImdbId(imdbId);
         }
 
@@ -499,9 +514,9 @@ export async function process(
                 await writeJson(`${midhash}_tmdb.json`, tmdbData);
             }
 
-            console.log(`[tmdb] Fetched TMDB data for ${request.filePath}`);
+            console.log(`[tmdb] Fetched TMDB data for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
         } else {
-            console.log(`[tmdb] No TMDB match found for ${request.filePath}`);
+            console.log(`[tmdb] No TMDB match found for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
         }
 
         await sendCallback({

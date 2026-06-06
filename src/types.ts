@@ -41,7 +41,8 @@ export interface HealthResponse {
 export interface ProcessRequest {
     taskId: string;
     cid: string;
-    filePath: string;
+    /** Optional: TMDB never reads the source file — used only for log context. */
+    filePath?: string;
     callbackUrl: string;
     metaCoreUrl: string;
     existingMeta?: Record<string, string>;

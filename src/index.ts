@@ -48,8 +48,12 @@ app.post('/recompute', async () => {
     return { status: 'ok', message: 'Recompute mode enabled' };
 });
 app.post<{ Body: ProcessRequest }>('/process', async (request, reply) => {
-    const { taskId, cid, filePath, callbackUrl, metaCoreUrl } = request.body;
-    if (!taskId || !cid || !filePath || !callbackUrl || !metaCoreUrl) {
+    // filePath is optional: TMDB resolves purely from existingMeta
+    // (originalTitle/movieYear/videoType/imdbid produced by filename-parser) and
+    // writes back to `cid`. It never reads the source file. This lets the gateway
+    // feeders drive TMDB from parsed metadata alone, with no file on disk.
+    const { taskId, cid, callbackUrl, metaCoreUrl } = request.body;
+    if (!taskId || !cid || !callbackUrl || !metaCoreUrl) {
         return reply.send({ status: 'rejected', error: 'Missing required fields' } as ProcessResponse);
     }
     processFile(request.body, async (payload: CallbackPayload) => {
