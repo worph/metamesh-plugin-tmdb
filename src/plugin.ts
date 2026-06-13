@@ -549,6 +549,22 @@ async function applyTmdbData(
     if (tmdbId) metadata.tmdbid = tmdbId;
     if (data.imdb_id) metadata.imdbid = data.imdb_id;
 
+    // Authoritative media type, stamped from TMDB's own payload shape. TV
+    // payloads carry `name`/`first_air_date`/`original_name`; movie payloads
+    // carry `title`/`release_date`/`original_title`. This overrides whatever the
+    // filename-parser guessed (`videoType`/`contentKind`), which it derives from
+    // a parsed season/episode — frequently absent for anime fansubs (absolute
+    // numbering, batch packs), the root cause of series being mislabeled films
+    // downstream in meta-watch. `videoType` (movie|tvshow) and `contentKind`
+    // (movie|episode) mirror the filename-parser's keys so consumers read one
+    // field regardless of the enrichment source.
+    const isTv =
+        data.first_air_date !== undefined ||
+        data.name !== undefined ||
+        data.original_name !== undefined;
+    metadata.videoType = isTv ? 'tvshow' : 'movie';
+    metadata.contentKind = isTv ? 'episode' : 'movie';
+
     // Title - store both original and localized
     const originalTitle = data.original_title || data.original_name;
     const localizedTitle = data.title || data.name;
