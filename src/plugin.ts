@@ -451,15 +451,25 @@ export async function process(
             console.log(`[tmdb] Force recompute enabled for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
         }
 
-        // Get midhash for caching
-        const midhash = existingMeta?.['cid_midhash256'];
+        const label = request.filePath ?? existingMeta?.fileName ?? cid;
 
-        // Check cache (skip if forceRecompute)
+        // Exact-file cache, keyed by the file's byte-hash. Only records carrying
+        // real file bytes have `cid_midhash256`; gateway/usenet records don't —
+        // which is exactly why the per-tmdbid cache below exists. Stores a full
+        // entry now, but tolerates the legacy raw-payload format from older builds.
+        const midhash = existingMeta?.['cid_midhash256'];
         if (midhash && !forceRecompute) {
-            const cachedData = await readJson<any>(`${midhash}_tmdb.json`);
-            if (cachedData) {
-                console.log(`[tmdb] Using cached TMDB data for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
-                await applyTmdbData(metaCore, cid, cachedData);
+            const cached = await readJson<any>(`${midhash}_tmdb.json`);
+            if (cached) {
+                console.log(`[tmdb] Using byte-hash cached TMDB data for ${label}`);
+                const isEntry = cached.data !== undefined;
+                await applyTmdbData(
+                    metaCore,
+                    cid,
+                    isEntry ? cached.data : cached,
+                    // Legacy raw payloads carry no image CIDs → let applyTmdbData recompute.
+                    isEntry ? { posterCid: cached.posterCid, backdropCid: cached.backdropCid } : undefined
+                );
                 await sendCallback({
                     taskId: request.taskId,
                     status: 'completed',
@@ -469,54 +479,69 @@ export async function process(
             }
         }
 
-        let tmdbData = null;
-
-        // Resolve by a known TMDB id first (authoritative — e.g. a gateway
-        // anchor or jellyfin-nfo). Completes the full cycle (poster + plot +
-        // genres) from an id alone, with no fuzzy re-search.
+        // Resolve the show/movie entry, deduped per tmdbid. A record that already
+        // carries a tmdbid anchor (every gateway torrent/usenet hit does) takes
+        // the cached + single-flighted fast path, so N releases of one show share
+        // ONE TMDB fetch + poster seed instead of N.
+        let entry: TmdbCacheEntry | null = null;
         const knownTmdbId = existingMeta?.tmdbid;
         if (knownTmdbId) {
             const mediaType =
                 existingMeta?.videoType === 'tvshow' || existingMeta?.videoType === 'tv'
                     ? 'tv'
                     : 'movie';
-            tmdbData = await getByTmdbId(knownTmdbId, mediaType);
+            entry = await resolveEntryById(knownTmdbId, mediaType);
         }
 
-        // Try by IMDB ID
-        const imdbId = existingMeta?.imdbid;
-        if (!tmdbData && imdbId) {
-            tmdbData = await findByImdbId(imdbId);
-        }
+        // Fallback: no usable id → resolve by IMDB id or fuzzy title, then cache
+        // the result by its resolved tmdbid so later releases of the same show
+        // take the fast path above.
+        if (!entry) {
+            let tmdbData: any = null;
 
-        // Try by title search
-        if (!tmdbData) {
-            let title = existingMeta?.originalTitle || existingMeta?.fileName;
-            const year = existingMeta?.movieYear;
-            const videoType = existingMeta?.videoType;
-
-            // Strip trailing year from title if present (e.g., "Sintel 2010" -> "Sintel")
-            if (title && year) {
-                const yearRegex = new RegExp(`\\s*[\\(\\[]?${year}[\\)\\]]?\\s*$`);
-                title = title.replace(yearRegex, '').trim();
+            const imdbId = existingMeta?.imdbid;
+            if (imdbId) {
+                tmdbData = await findByImdbId(imdbId);
             }
 
-            if (title) {
-                tmdbData = await searchByTitle(title, year, videoType);
+            if (!tmdbData) {
+                let title = existingMeta?.originalTitle || existingMeta?.fileName;
+                const year = existingMeta?.movieYear;
+                const videoType = existingMeta?.videoType;
+
+                // Strip trailing year from title if present ("Sintel 2010" -> "Sintel").
+                if (title && year) {
+                    const yearRegex = new RegExp(`\\s*[\\(\\[]?${year}[\\)\\]]?\\s*$`);
+                    title = title.replace(yearRegex, '').trim();
+                }
+
+                if (title) {
+                    tmdbData = await searchByTitle(title, year, videoType);
+                }
+            }
+
+            if (tmdbData) {
+                const images = await computeImageCids(tmdbData);
+                entry = { data: tmdbData, ...images };
+                if (tmdbData.id) {
+                    await writeJson(tmdbCacheKey(String(tmdbData.id), mediaTypeOf(tmdbData)), entry);
+                }
             }
         }
 
-        if (tmdbData) {
-            await applyTmdbData(metaCore, cid, tmdbData);
-
-            // Cache TMDB data for future use
+        if (entry) {
+            await applyTmdbData(metaCore, cid, entry.data, {
+                posterCid: entry.posterCid,
+                backdropCid: entry.backdropCid,
+            });
+            // Keep the exact-file cache warm too, so a future re-enrichment of
+            // this same file skips straight to the byte-hash hit.
             if (midhash) {
-                await writeJson(`${midhash}_tmdb.json`, tmdbData);
+                await writeJson(`${midhash}_tmdb.json`, entry);
             }
-
-            console.log(`[tmdb] Fetched TMDB data for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
+            console.log(`[tmdb] Enriched ${label} (tmdbid=${entry.data.id})`);
         } else {
-            console.log(`[tmdb] No TMDB match found for ${request.filePath ?? existingMeta?.fileName ?? cid}`);
+            console.log(`[tmdb] No TMDB match found for ${label}`);
         }
 
         await sendCallback({
@@ -534,14 +559,106 @@ export async function process(
     }
 }
 
+/** Resolved TMDB payload plus the seeded poster/backdrop CIDs, cached per
+ *  tmdbid. Every torrent/usenet release of an episode carries the same
+ *  `tmdbid`, and TMDB only gives us show/movie-level fields (poster, plot,
+ *  genres — no per-episode data), so N releases can share ONE fetch + seed. */
+interface TmdbCacheEntry {
+    data: any;
+    posterCid: string | null;
+    backdropCid: string | null;
+}
+
+// In-process single-flight: collapses concurrent resolves of the same key onto
+// one promise, so a burst of same-tmdbid records that all miss the cold cache
+// triggers a single TMDB fetch (no thundering herd) — the rest await it.
+const tmdbEntryInflight = new Map<string, Promise<TmdbCacheEntry | null>>();
+
+// Persistent cache filename for a resolved show/movie. Includes mediaType +
+// language so a tv/movie id clash or a language switch can't return stale text.
+function tmdbCacheKey(tmdbId: string, mediaType: string): string {
+    return `tmdbid_${mediaType}_${tmdbId}_${metadataLanguage}_tmdb.json`;
+}
+
+// Media type from a raw TMDB payload's own shape (tv payloads carry
+// name/first_air_date). Mirrors the check in applyTmdbData.
+function mediaTypeOf(data: any): string {
+    return data?.first_air_date !== undefined ||
+        data?.name !== undefined ||
+        data?.original_name !== undefined
+        ? 'tv'
+        : 'movie';
+}
+
+// Download + hash the poster/backdrop for a resolved payload. Record-independent
+// (the image filename is keyed by tmdbId, so the blob dedups across records), so
+// the CIDs can be computed once per show and reused for every release.
+async function computeImageCids(
+    data: any
+): Promise<{ posterCid: string | null; backdropCid: string | null }> {
+    const tmdbId = data?.id ? String(data.id) : '';
+    const displayTitle =
+        data?.title || data?.name || data?.original_title || data?.original_name || 'Unknown';
+    const releaseDate = data?.release_date || data?.first_air_date;
+    const year = releaseDate ? releaseDate.split('-')[0] : undefined;
+    const posterCid =
+        data?.poster_path && tmdbId
+            ? await downloadAndHashImage(data.poster_path, 'poster', displayTitle, year, tmdbId)
+            : null;
+    const backdropCid =
+        data?.backdrop_path && tmdbId
+            ? await downloadAndHashImage(data.backdrop_path, 'backdrop', displayTitle, year, tmdbId)
+            : null;
+    return { posterCid, backdropCid };
+}
+
+// Resolve the full entry (payload + image CIDs) for a KNOWN tmdbid, served from
+// the persistent per-tmdbid cache when possible and single-flighted otherwise.
+// This is the hot path for gateway records (torrent + usenet), which always
+// carry a `tmdbid` anchor — so N releases of one show share one TMDB fetch.
+async function resolveEntryById(
+    tmdbId: string,
+    mediaType: string
+): Promise<TmdbCacheEntry | null> {
+    const key = tmdbCacheKey(tmdbId, mediaType);
+    if (!forceRecompute) {
+        const cached = await readJson<TmdbCacheEntry>(key);
+        if (cached?.data) {
+            return cached;
+        }
+    }
+    const inflight = tmdbEntryInflight.get(key);
+    if (inflight) {
+        return inflight;
+    }
+    const pending = (async (): Promise<TmdbCacheEntry | null> => {
+        console.log(`[tmdb] Resolving TMDB ${mediaType}/${tmdbId} (cache miss)`);
+        const data = await getByTmdbId(tmdbId, mediaType);
+        if (!data) {
+            return null;
+        }
+        const images = await computeImageCids(data);
+        const entry: TmdbCacheEntry = { data, ...images };
+        await writeJson(key, entry);
+        return entry;
+    })();
+    tmdbEntryInflight.set(key, pending);
+    try {
+        return await pending;
+    } finally {
+        tmdbEntryInflight.delete(key);
+    }
+}
+
 /**
  * Apply TMDB data to KV store using same keys as old TMDBProcessor
  */
 async function applyTmdbData(
     metaCore: MetaCoreClient,
     cid: string,
-    data: any
-): Promise<void> {
+    data: any,
+    images?: { posterCid: string | null; backdropCid: string | null }
+): Promise<{ posterCid: string | null; backdropCid: string | null }> {
     const metadata: Record<string, string> = {};
 
     // Basic IDs
@@ -625,35 +742,29 @@ async function applyTmdbData(
     // Add tmdb-verified tag (same as old processor)
     await metaCore.addToSet(cid, 'tags', 'tmdb-verified');
 
-    // Download poster and backdrop images to plugin output folder. The
-    // watcher picks them up as first-class file entries, so all we need to
-    // store is the CID — `/api/file/{cid}` resolves through the standard
-    // reverse index, no path companion needed.
-    if (data.poster_path && tmdbId) {
-        const posterCid = await downloadAndHashImage(
-            data.poster_path,
-            'poster',
-            displayTitle,
-            year,
-            tmdbId
-        );
-        if (posterCid) {
-            await metaCore.setProperty(cid, 'poster', posterCid);
-            console.log(`[tmdb] Set poster CID: ${posterCid}`);
-        }
+    // Poster/backdrop CIDs. Reuse the precomputed values when the caller already
+    // seeded them (a per-tmdbid cache hit — so we don't re-download + re-hash the
+    // same image for every release of a show); otherwise download + hash now.
+    // The image filename is keyed by tmdbId, so the blob is deduped either way —
+    // this just also skips the WebDAV round-trips. The watcher picks the images
+    // up as first-class file entries, so storing the CID is all that's needed.
+    let posterCid = images ? images.posterCid : null;
+    if (!images && data.poster_path && tmdbId) {
+        posterCid = await downloadAndHashImage(data.poster_path, 'poster', displayTitle, year, tmdbId);
+    }
+    if (posterCid) {
+        await metaCore.setProperty(cid, 'poster', posterCid);
+        console.log(`[tmdb] Set poster CID: ${posterCid}`);
     }
 
-    if (data.backdrop_path && tmdbId) {
-        const backdropCid = await downloadAndHashImage(
-            data.backdrop_path,
-            'backdrop',
-            displayTitle,
-            year,
-            tmdbId
-        );
-        if (backdropCid) {
-            await metaCore.setProperty(cid, 'backdrop', backdropCid);
-            console.log(`[tmdb] Set backdrop CID: ${backdropCid}`);
-        }
+    let backdropCid = images ? images.backdropCid : null;
+    if (!images && data.backdrop_path && tmdbId) {
+        backdropCid = await downloadAndHashImage(data.backdrop_path, 'backdrop', displayTitle, year, tmdbId);
     }
+    if (backdropCid) {
+        await metaCore.setProperty(cid, 'backdrop', backdropCid);
+        console.log(`[tmdb] Set backdrop CID: ${backdropCid}`);
+    }
+
+    return { posterCid, backdropCid };
 }
