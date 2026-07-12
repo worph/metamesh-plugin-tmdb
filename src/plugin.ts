@@ -9,7 +9,8 @@
  * PLUGIN FILE ACCESS ARCHITECTURE
  * ============================================================================
  *
- * File access via WebDAV (WEBDAV_URL environment variable):
+ * File access via WebDAV, on the meta-core named by each /process request
+ * (its /urls -> webdavUrlInternal; WEBDAV_URL overrides):
  *   - Read media files:  GET  /webdav/watch/...  or /webdav/test/...
  *   - Write output:      PUT  /webdav/plugin/tmdb/...
  *   - Cache:             Local /cache mount (for JSON cache files)
@@ -18,6 +19,7 @@
  *   - No output mount needed on plugin containers
  *   - Consistent read/write architecture via HTTP
  *   - Works in any orchestration environment
+ *   - Posters land in the same core the CIDs are written to, always
  *
  * ============================================================================
  *
@@ -30,21 +32,12 @@
  */
 
 import axios from 'axios';
-import { statSync, openSync, readSync, closeSync } from 'fs';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
 import { readJson, writeJson } from './cache.js';
-import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
-
-// Initialize WebDAV client - required for plugin operation
-const webdavClient = createWebDAVClient();
-if (webdavClient) {
-    console.log('[tmdb] WebDAV client initialized for file access');
-} else {
-    console.warn('[tmdb] WARNING: WEBDAV_URL not set - plugin will not be able to write output files');
-}
+import { getWebDAVClient, WebDAVClient } from './webdav-client.js';
 
 const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
 
@@ -52,53 +45,13 @@ const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
  * ============================================================================
  * PLUGIN OUTPUT PATH - Written via WebDAV
  * ============================================================================
- * Output files (posters, backdrops) are written via WebDAV PUT requests.
- * Path: /files/plugin/tmdb/<filename> (accessible at WEBDAV_URL/plugin/tmdb/)
+ * Output files (posters, backdrops) are written via WebDAV PUT requests, to the
+ * WebDAV of the meta-core that issued the /process call.
+ * Path: /files/plugin/tmdb/<filename>
  * CACHE_PATH (/cache) - Local mount for plugin cache (handled by cache.ts)
  * ============================================================================
  */
 const PLUGIN_OUTPUT_WEBDAV_PATH = '/files/plugin/tmdb';
-
-/**
- * Compute midhash256 CID for a file (matches meta-hash algorithm)
- *
- * Algorithm:
- * - For files <= 1MB: Hashes entire file content + 8-byte size prefix
- * - For files > 1MB: Hashes middle 1MB + 8-byte size prefix
- * - Returns CIDv1 with custom codec 0x1000
- */
-function computeMidHash256Sync(filePath: string): string {
-    const SAMPLE_SIZE = 1024 * 1024; // 1MB
-    // varint encoding of 0x1000 (4096) for both codec and hash function code
-    const MIDHASH_VARINT = Buffer.from([0x80, 0x20]);
-
-    // Get file size
-    const stats = statSync(filePath);
-    const fileSize = stats.size;
-
-    // Create size buffer (64-bit big-endian)
-    const sizeBuffer = Buffer.allocUnsafe(8);
-    sizeBuffer.writeBigUInt64BE(BigInt(fileSize), 0);
-
-    // Extract sample data
-    let sampleData: Buffer;
-    if (fileSize <= SAMPLE_SIZE) {
-        // Small file: read entire content
-        const fd = openSync(filePath, 'r');
-        sampleData = Buffer.allocUnsafe(fileSize);
-        readSync(fd, sampleData, 0, fileSize, 0);
-        closeSync(fd);
-    } else {
-        // Large file: read middle 1MB
-        const middleOffset = Math.floor((fileSize - SAMPLE_SIZE) / 2);
-        const fd = openSync(filePath, 'r');
-        sampleData = Buffer.allocUnsafe(SAMPLE_SIZE);
-        readSync(fd, sampleData, 0, SAMPLE_SIZE, middleOffset);
-        closeSync(fd);
-    }
-
-    return computeMidHash256FromData(fileSize, sampleData);
-}
 
 /**
  * Compute midhash256 CID via WebDAV
@@ -168,16 +121,6 @@ function computeMidHash256FromData(fileSize: number, sampleData: Buffer): string
     }
 
     return cid;
-}
-
-/**
- * Compute midhash256 CID for a file (auto-selects WebDAV or filesystem)
- */
-async function computeMidHash256(filePath: string): Promise<string> {
-    if (webdavClient) {
-        return computeMidHash256WebDAV(webdavClient, filePath);
-    }
-    return computeMidHash256Sync(filePath);
 }
 
 export const manifest: PluginManifest = {
@@ -352,6 +295,7 @@ async function downloadImageToWebDAV(
  * no need to store any path in the parent file's metadata.
  */
 async function downloadAndHashImage(
+    webdavClient: WebDAVClient | null,
     imagePath: string,
     imageType: string,
     title: string,
@@ -409,6 +353,9 @@ export async function process(
 ): Promise<void> {
     const startTime = Date.now();
     const metaCore = new MetaCoreClient(request.metaCoreUrl);
+    // WebDAV of the very core we're enriching, so poster blobs and the poster
+    // CIDs we write can never point at different cores. Cached per core URL.
+    const webdavClient = await getWebDAVClient(request.metaCoreUrl);
 
     try {
         const { cid, existingMeta } = request;
@@ -465,6 +412,7 @@ export async function process(
                 const isEntry = cached.data !== undefined;
                 await applyTmdbData(
                     metaCore,
+                    webdavClient,
                     cid,
                     isEntry ? cached.data : cached,
                     // Legacy raw payloads carry no image CIDs → let applyTmdbData recompute.
@@ -490,7 +438,7 @@ export async function process(
                 existingMeta?.videoType === 'tvshow' || existingMeta?.videoType === 'tv'
                     ? 'tv'
                     : 'movie';
-            entry = await resolveEntryById(knownTmdbId, mediaType);
+            entry = await resolveEntryById(webdavClient, knownTmdbId, mediaType);
         }
 
         // Fallback: no usable id → resolve by IMDB id or fuzzy title, then cache
@@ -521,7 +469,7 @@ export async function process(
             }
 
             if (tmdbData) {
-                const images = await computeImageCids(tmdbData);
+                const images = await computeImageCids(webdavClient, tmdbData);
                 entry = { data: tmdbData, ...images };
                 if (tmdbData.id) {
                     await writeJson(tmdbCacheKey(String(tmdbData.id), mediaTypeOf(tmdbData)), entry);
@@ -530,7 +478,7 @@ export async function process(
         }
 
         if (entry) {
-            await applyTmdbData(metaCore, cid, entry.data, {
+            await applyTmdbData(metaCore, webdavClient, cid, entry.data, {
                 posterCid: entry.posterCid,
                 backdropCid: entry.backdropCid,
             });
@@ -594,6 +542,7 @@ function mediaTypeOf(data: any): string {
 // (the image filename is keyed by tmdbId, so the blob dedups across records), so
 // the CIDs can be computed once per show and reused for every release.
 async function computeImageCids(
+    webdavClient: WebDAVClient | null,
     data: any
 ): Promise<{ posterCid: string | null; backdropCid: string | null }> {
     const tmdbId = data?.id ? String(data.id) : '';
@@ -603,11 +552,11 @@ async function computeImageCids(
     const year = releaseDate ? releaseDate.split('-')[0] : undefined;
     const posterCid =
         data?.poster_path && tmdbId
-            ? await downloadAndHashImage(data.poster_path, 'poster', displayTitle, year, tmdbId)
+            ? await downloadAndHashImage(webdavClient, data.poster_path, 'poster', displayTitle, year, tmdbId)
             : null;
     const backdropCid =
         data?.backdrop_path && tmdbId
-            ? await downloadAndHashImage(data.backdrop_path, 'backdrop', displayTitle, year, tmdbId)
+            ? await downloadAndHashImage(webdavClient, data.backdrop_path, 'backdrop', displayTitle, year, tmdbId)
             : null;
     return { posterCid, backdropCid };
 }
@@ -617,6 +566,7 @@ async function computeImageCids(
 // This is the hot path for gateway records (torrent + usenet), which always
 // carry a `tmdbid` anchor — so N releases of one show share one TMDB fetch.
 async function resolveEntryById(
+    webdavClient: WebDAVClient | null,
     tmdbId: string,
     mediaType: string
 ): Promise<TmdbCacheEntry | null> {
@@ -637,7 +587,7 @@ async function resolveEntryById(
         if (!data) {
             return null;
         }
-        const images = await computeImageCids(data);
+        const images = await computeImageCids(webdavClient, data);
         const entry: TmdbCacheEntry = { data, ...images };
         await writeJson(key, entry);
         return entry;
@@ -655,6 +605,7 @@ async function resolveEntryById(
  */
 async function applyTmdbData(
     metaCore: MetaCoreClient,
+    webdavClient: WebDAVClient | null,
     cid: string,
     data: any,
     images?: { posterCid: string | null; backdropCid: string | null }
@@ -750,7 +701,7 @@ async function applyTmdbData(
     // up as first-class file entries, so storing the CID is all that's needed.
     let posterCid = images ? images.posterCid : null;
     if (!images && data.poster_path && tmdbId) {
-        posterCid = await downloadAndHashImage(data.poster_path, 'poster', displayTitle, year, tmdbId);
+        posterCid = await downloadAndHashImage(webdavClient, data.poster_path, 'poster', displayTitle, year, tmdbId);
     }
     if (posterCid) {
         await metaCore.setProperty(cid, 'poster', posterCid);
@@ -759,7 +710,7 @@ async function applyTmdbData(
 
     let backdropCid = images ? images.backdropCid : null;
     if (!images && data.backdrop_path && tmdbId) {
-        backdropCid = await downloadAndHashImage(data.backdrop_path, 'backdrop', displayTitle, year, tmdbId);
+        backdropCid = await downloadAndHashImage(webdavClient, data.backdrop_path, 'backdrop', displayTitle, year, tmdbId);
     }
     if (backdropCid) {
         await metaCore.setProperty(cid, 'backdrop', backdropCid);
