@@ -632,6 +632,10 @@ async function applyTmdbData(
         data.original_name !== undefined;
     metadata.videoType = isTv ? 'tvshow' : 'movie';
     metadata.contentKind = isTv ? 'episode' : 'movie';
+    // `domain` is written in the same breath as `contentKind`
+    // (METADATA_KEYS.md §1) — it is the key meta-watch filters its wall on,
+    // and TMDB is precisely the identity graph that decides film vs tv here.
+    metadata.domain = isTv ? 'tv' : 'film';
 
     // Title - store both original and localized
     const originalTitle = data.original_title || data.original_name;
