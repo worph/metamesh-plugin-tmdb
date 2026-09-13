@@ -5,7 +5,7 @@
   "description": "MetaMesh plugin: Fetches metadata from TMDB API",
   "type": "module",
   "main": "dist/index.js",
-  "scripts": { "build": "tsc", "start": "node dist/index.js" },
+  "scripts": { "build": "tsc", "start": "node dist/index.js", "test": "vitest run", "test:watch": "vitest" },
   "dependencies": { "fastify": "^5.0.0", "axios": "^1.6.0" },
-  "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.3.0" }
+  "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.3.0", "vitest": "^1.6.1" }
 }

@@ -25,10 +25,12 @@
  *
  * Matches old TMDBProcessor output:
  * - tmdbid, imdbid
- * - originalTitle, movieYear, releasedate
+ * - title, originalTitle, movieYear, releasedate
+ * - titles/<lang3>/<name> key-set: localized + original title + every AKA
  * - plot/eng, rating
  * - genres (add), studio (add), tags (add)
  * - poster, backdrop (CID hashes of downloaded images)
+ * - posters/{lang3}/{cid} (alternative posters as url locators, `poster` among them)
  */
 
 import axios from 'axios';
@@ -38,6 +40,8 @@ import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js
 import { MetaCoreClient } from './meta-core-client.js';
 import { readJson, writeJson } from './cache.js';
 import { getWebDAVClient, WebDAVClient } from './webdav-client.js';
+import { base32LowerMultibase } from './cid.js';
+import { posterMembers } from './posters.js';
 
 const IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/original';
 
@@ -104,23 +108,7 @@ function computeMidHash256FromData(fileSize: number, sampleData: Buffer): string
     ]);
 
     // Encode as base32lower with 'b' prefix (multibase)
-    const base32Chars = 'abcdefghijklmnopqrstuvwxyz234567';
-    let cid = 'b';
-    let bits = 0;
-    let value = 0;
-    for (const byte of cidBytes) {
-        value = (value << 8) | byte;
-        bits += 8;
-        while (bits >= 5) {
-            bits -= 5;
-            cid += base32Chars[(value >> bits) & 0x1f];
-        }
-    }
-    if (bits > 0) {
-        cid += base32Chars[(value << (5 - bits)) & 0x1f];
-    }
-
-    return cid;
+    return base32LowerMultibase(cidBytes);
 }
 
 export const manifest: PluginManifest = {
@@ -167,6 +155,51 @@ export const manifest: PluginManifest = {
 let forceRecompute = false;
 
 const BASE_URL = 'https://api.themoviedb.org/3';
+
+// ISO 639-1 → ISO 639-3 (`lang3`, the 639-2/T form where B/T differ) for the
+// languages TMDB commonly returns. Unknown codes map to nothing.
+const ISO639_1_TO_3: Record<string, string> = {
+    en: 'eng', ja: 'jpn', fr: 'fra', de: 'deu', es: 'spa', it: 'ita', ru: 'rus',
+    ko: 'kor', zh: 'zho', pt: 'por', nl: 'nld', sv: 'swe', no: 'nor', da: 'dan',
+    fi: 'fin', pl: 'pol', tr: 'tur', cs: 'ces', hu: 'hun', el: 'ell', he: 'heb',
+    th: 'tha', vi: 'vie', id: 'ind', uk: 'ukr', ro: 'ron', ar: 'ara', fa: 'fas',
+    hi: 'hin', ta: 'tam', te: 'tel', ms: 'msa', tl: 'tgl', ca: 'cat', bg: 'bul',
+    hr: 'hrv', sr: 'srp', sk: 'slk', sl: 'slv', et: 'est', lv: 'lav', lt: 'lit',
+    is: 'isl', ga: 'gle', cn: 'zho',
+};
+
+function iso639_1to3(code: string | undefined | null): string | undefined {
+    return code ? ISO639_1_TO_3[code.trim().toLowerCase()] : undefined;
+}
+
+// TMDB keys AKAs by MARKET (`iso_3166_1`), not language. Only markets that
+// clearly imply one language are mapped; a multilingual or unknown market
+// (CA, CH, BE, IN, HK, SG, …, or empty) files its AKA under `und` rather than
+// guessing (METADATA_KEYS.md §3).
+const MARKET_TO_LANG3: Record<string, string> = {
+    US: 'eng', GB: 'eng', AU: 'eng', NZ: 'eng', IE: 'eng',
+    FR: 'fra', DE: 'deu', AT: 'deu', ES: 'spa', MX: 'spa', AR: 'spa', CO: 'spa',
+    CL: 'spa', PE: 'spa', VE: 'spa', IT: 'ita', BR: 'por', PT: 'por', JP: 'jpn',
+    KR: 'kor', CN: 'zho', TW: 'zho', RU: 'rus', NL: 'nld', SE: 'swe', NO: 'nor',
+    DK: 'dan', FI: 'fin', PL: 'pol', TR: 'tur', CZ: 'ces', HU: 'hun', GR: 'ell',
+    IL: 'heb', TH: 'tha', VN: 'vie', ID: 'ind', UA: 'ukr', RO: 'ron', IR: 'fas',
+    SA: 'ara', EG: 'ara', AE: 'ara', BG: 'bul', HR: 'hrv', RS: 'srp', SK: 'slk',
+    SI: 'slv', EE: 'est', LV: 'lav', LT: 'lit', IS: 'isl',
+};
+
+function marketToLang3(market: string | undefined | null): string {
+    return (market && MARKET_TO_LANG3[market.trim().toUpperCase()]) || 'und';
+}
+
+/**
+ * `titles/<lang3>/<name>` key-set member key (METADATA_KEYS.md §3): trimmed,
+ * whitespace collapsed, `/` (the key-set separator) written as U+2215 `∕`.
+ * `undefined` when nothing is left to name.
+ */
+function titleMemberKey(lang3: string, name: string | undefined | null): string | undefined {
+    const clean = (name ?? '').trim().replace(/\s+/g, ' ').replace(/\//g, '\u2215');
+    return clean ? `titles/${lang3}/${clean}` : undefined;
+}
 
 let apiKey: string | null = null;
 let isV4Token = false;
@@ -218,7 +251,17 @@ async function findByImdbId(imdbId: string): Promise<any> {
 
 async function getByTmdbId(tmdbId: string, mediaType: string): Promise<any> {
     try {
-        const config = getAxiosConfig({ language: metadataLanguage });
+        // `alternative_titles` rides along so the AKAs land in `titles/*` (§3).
+        // `images` rides the same call too: the poster candidates for the
+        // `posters/{lang3}/{cid}` key-set (§6). `language` would otherwise filter
+        // them to one language, so widen it to the configured one, English and
+        // textless (`null`).
+        const lang1 = metadataLanguage.split('-')[0];
+        const config = getAxiosConfig({
+            language: metadataLanguage,
+            append_to_response: 'alternative_titles,images',
+            include_image_language: [...new Set([lang1, 'en'])].join(',') + ',null',
+        });
         const response = await axios.get(`${BASE_URL}/${mediaType}/${tmdbId}`, config);
         return response.data;
     } catch {
@@ -406,7 +449,7 @@ export async function process(
         // entry now, but tolerates the legacy raw-payload format from older builds.
         const midhash = existingMeta?.['cid_midhash256'];
         if (midhash && !forceRecompute) {
-            const cached = await readJson<any>(`${midhash}_tmdb.json`);
+            const cached = await readJson<any>(`${midhash}_aka_tmdb.json`);
             if (cached) {
                 console.log(`[tmdb] Using byte-hash cached TMDB data for ${label}`);
                 const isEntry = cached.data !== undefined;
@@ -485,7 +528,7 @@ export async function process(
             // Keep the exact-file cache warm too, so a future re-enrichment of
             // this same file skips straight to the byte-hash hit.
             if (midhash) {
-                await writeJson(`${midhash}_tmdb.json`, entry);
+                await writeJson(`${midhash}_aka_tmdb.json`, entry);
             }
             console.log(`[tmdb] Enriched ${label} (tmdbid=${entry.data.id})`);
         } else {
@@ -525,7 +568,9 @@ const tmdbEntryInflight = new Map<string, Promise<TmdbCacheEntry | null>>();
 // Persistent cache filename for a resolved show/movie. Includes mediaType +
 // language so a tv/movie id clash or a language switch can't return stale text.
 function tmdbCacheKey(tmdbId: string, mediaType: string): string {
-    return `tmdbid_${mediaType}_${tmdbId}_${metadataLanguage}_tmdb.json`;
+    // `_aka`: entries written before `alternative_titles` was appended carry no
+    // AKAs, so the name moved to make them refetch once.
+    return `tmdbid_${mediaType}_${tmdbId}_${metadataLanguage}_aka_tmdb.json`;
 }
 
 // Media type from a raw TMDB payload's own shape (tv payloads carry
@@ -652,6 +697,23 @@ async function applyTmdbData(
         metadata.originalTitle = originalTitle;
     }
 
+    // Every clean name as a `titles/<lang3>/<name>` key-set member
+    // (METADATA_KEYS.md §3): the localized title under the configured metadata
+    // language, the original title under TMDB's `original_language`, and each
+    // AKA under the language its market implies (`und` when it doesn't).
+    const addTitleMember = (lang3: string, name: string | undefined) => {
+        const key = titleMemberKey(lang3, name);
+        if (key) metadata[key] = 'true';
+    };
+    addTitleMember(iso639_1to3(metadataLanguage.split('-')[0]) ?? 'und', localizedTitle);
+    addTitleMember(iso639_1to3(data.original_language) ?? 'und', originalTitle);
+    const akas = data.alternative_titles?.titles ?? data.alternative_titles?.results;
+    if (Array.isArray(akas)) {
+        for (const aka of akas) {
+            addTitleMember(marketToLang3(aka?.iso_3166_1), aka?.title);
+        }
+    }
+
     // Dates
     const releaseDate = data.release_date || data.first_air_date;
     let year: string | undefined;
@@ -666,9 +728,8 @@ async function applyTmdbData(
     // Plot (in configured language)
     if (data.overview) {
         // Extract language code from metadataLanguage (e.g., 'en-US' -> 'eng')
-        const langCode = metadataLanguage.split('-')[0];
-        const langKey = langCode === 'en' ? 'eng' : langCode;
-        metadata[`plot/${langKey}`] = data.overview;
+        const langKey = iso639_1to3(metadataLanguage.split('-')[0]);
+        if (langKey) metadata[`plot/${langKey}`] = data.overview;
         // Also set as primary plot for compatibility
         metadata['plot/eng'] = data.overview;
     }
@@ -710,6 +771,14 @@ async function applyTmdbData(
     if (posterCid) {
         await metaCore.setProperty(cid, 'poster', posterCid);
         console.log(`[tmdb] Set poster CID: ${posterCid}`);
+        // The alternatives, as the `posters/{lang3}/{cid}` key-set with `poster`
+        // among them (METADATA_KEYS.md §6). Leaf keys through PATCH — never
+        // addToSet, which writes the legacy comma-joined csv-set. Empty for a
+        // cached payload from before the `images` append: no backfill by design.
+        const members = posterMembers(data, posterCid);
+        if (Object.keys(members).length > 0) {
+            await metaCore.mergeMetadata(cid, members);
+        }
     }
 
     let backdropCid = images ? images.backdropCid : null;

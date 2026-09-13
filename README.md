@@ -8,7 +8,8 @@ This plugin enriches video metadata by querying the TMDB API:
 
 - **Search by IMDB ID**: Uses existing IMDB ID for precise matching
 - **Search by title**: Falls back to title/year search
-- **Image download**: Downloads poster and backdrop images to `/files/poster/`
+- **Image download**: Downloads poster and backdrop images to `/files/plugin/tmdb/`
+- **Alternative posters**: Lists up to 10 posters (the primary plus the best-voted alternatives, as `url` locator CIDs — nothing extra is downloaded)
 - **Rich metadata**: Fetches plot, rating, genres, studios
 
 **Note**: This runs on the background queue as it makes external API calls.
@@ -26,9 +27,8 @@ This plugin enriches video metadata by querying the TMDB API:
 | `rating` | Vote average |
 | `plot/eng` | English plot synopsis |
 | `poster` | Poster image CID |
-| `posterPath` | Poster file path |
+| `posters/{lang3}/{cid}` | Alternative posters key-set, `poster` among them (METADATA_KEYS.md §6) |
 | `backdrop` | Backdrop image CID |
-| `backdropPath` | Backdrop file path |
 | `genres` | Genre set |
 | `studio` | Production company set |
 
